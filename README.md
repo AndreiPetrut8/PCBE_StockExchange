@@ -36,15 +36,18 @@ pom.xml
 ## Responsabilitati
 
 - `domain` contine modelele pentru companii, ordine si tranzactii.
-- `market` va contine registrul comun de ordine si logica de potrivire a
-  ordinelor de cumparare cu cele de vanzare.
+- `market` pastreaza ordinele pe companie si le executa cand pretul simulat
+  atinge limita ordinului.
 - `server` accepta conexiunile si trateaza fiecare client.
 - `client` separa codul comun de comunicare de rolurile cumparator si vanzator.
 - `protocol` defineste mesajele schimbate intre clienti si server.
 - `Main` este punctul de pornire al aplicatiei.
 
-Structura este scheletul proiectului; logica efectiva de conectare, potrivire si
-actualizare a ordinelor urmeaza sa fie implementata in clasele corespunzatoare.
+Ordinele BUY se executa cand pretul companiei ajunge la sau sub pretul limita;
+ordinele SELL se executa cand pretul ajunge la sau peste limita. Fiecare ordin
+declansat se executa integral. Un BUY ramane deschis daca firma nu are suficiente
+actiuni disponibile. Simularea actualizeaza preturile prin `MatchingEngine`;
+tranzactiile actualizeaza cantitatea disponibila a companiei, nu pretul simulat.
 
 ## Compilare
 
