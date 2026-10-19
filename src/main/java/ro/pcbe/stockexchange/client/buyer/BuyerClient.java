@@ -1,6 +1,402 @@
 package ro.pcbe.stockexchange.client.buyer;
 
-import ro.pcbe.stockexchange.client.ExchangeClient;
+import ro.pcbe.stockexchange.domain.Order;
+import ro.pcbe.stockexchange.domain.OrderSide;
+import ro.pcbe.stockexchange.protocol.Message;
+import ro.pcbe.stockexchange.protocol.MessageType;
 
-public class BuyerClient extends ExchangeClient {
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.net.Socket;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Thread-safe buyer client.
+ *
+ * Concurrency design
+ * ------------------
+ *  - 3 kinds of threads touch this object:
+ *      * caller threads (console, or any number of strategy threads) call buy/cancel/modify
+ *      * ONE reader thread receives server messages and updates the state
+ *      * ONE writer thread is the only thread that ever writes to the socket
+ *  - Outgoing messages go through a BlockingQueue (producer/consumer). Callers never block on
+ *    network I/O and never share the ObjectOutputStream, so messages cannot interleave.
+ *  - All mutable buyer state (open orders, portfolio, prices, totals) is guarded by ONE lock,
+ *    so every update is atomic: a trade changes order list, portfolio and total as a single step
+ *    and a reader can never see them half-updated.
+ *  - Nothing blocking (socket I/O, printing) is done while holding the lock.
+ *  - Trades are applied idempotently (by trade id) and events may arrive in any order
+ *    (e.g. TRADE_EXECUTED before ORDER_ACCEPTED, because a BUY can fill immediately).
+ *
+ * Market rules this client relies on (OrderBook / Order):
+ *  - BUY triggers when companyPrice <= order price, executes at the order price,
+ *    and is filled completely or not at all.
+ *
+ * ASSUMED (not provided yet): Message(MessageType, String), getType(), getPayload(),
+ * the MessageType constants below, and ';' separated payloads.
+ */
+public class BuyerClient implements AutoCloseable {
+
+    private enum Status { PENDING, OPEN } // PENDING = sent, not yet confirmed by the server
+
+    private record OpenOrder(String id, String symbol, int quantity, double price, Status status) { }
+
+    private final String buyerId;
+    private final String host;
+    private final int port;
+
+    private Socket socket;
+    private ObjectOutputStream out;
+    private ObjectInputStream in;
+
+    private final BlockingQueue<Message> outbox = new LinkedBlockingQueue<>();
+    private Thread readerThread;
+    private Thread writerThread;
+    private volatile boolean running;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    // ---- state guarded by 'lock' ----
+    private final Object lock = new Object();
+    private final Map<String, OpenOrder> openOrders = new HashMap<>(); // orderId -> order
+    private final Map<String, Integer> portfolio = new HashMap<>();    // symbol -> shares owned
+    private final Map<String, Double> lastPrices = new HashMap<>();    // symbol -> last known price
+    private final Set<String> appliedTrades = new HashSet<>();         // trade ids already counted
+    private double totalSpent = 0;
+    // ---------------------------------
+
+    public BuyerClient(String buyerId, String host, int port) {
+        if (buyerId == null || buyerId.isBlank()) {
+            throw new IllegalArgumentException("Buyer ID must not be blank.");
+        }
+        this.buyerId = buyerId;
+        this.host = host;
+        this.port = port;
+    }
+
+    // ------------------------------------------------------------ connection
+
+    public void connect() throws IOException {
+        socket = new Socket(host, port);
+        out = new ObjectOutputStream(socket.getOutputStream()); // output first, then input
+        out.flush();
+        in = new ObjectInputStream(socket.getInputStream());
+        running = true;
+
+        writerThread = new Thread(this::writeLoop, "buyer-writer-" + buyerId);
+        readerThread = new Thread(this::readLoop, "buyer-reader-" + buyerId);
+        writerThread.setDaemon(true);
+        readerThread.setDaemon(true);
+        writerThread.start();
+        readerThread.start();
+
+        enqueue(MessageType.REGISTER, buyerId + ";BUYER");
+        enqueue(MessageType.LIST_COMPANIES, buyerId);
+    }
+
+    /** Non-blocking: hands the message to the writer thread. */
+    private boolean enqueue(MessageType type, String payload) {
+        if (!running) return false;
+        return outbox.offer(new Message(type, payload));
+    }
+
+    private void writeLoop() {
+        try {
+            while (true) {
+                Message m = outbox.poll(100, TimeUnit.MILLISECONDS);
+                if (m == null) {
+                    if (!running) break;      // nothing left to flush and we are closing
+                    continue;
+                }
+                out.writeObject(m);
+                out.flush();
+                out.reset();
+            }
+        } catch (IOException e) {
+            if (running) println("[!] Send failed: " + e.getMessage());
+            running = false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ------------------------------------------------------------ requests (thread-safe)
+
+    public void buy(String symbol, int quantity, double limitPrice) {
+        if (!running) {
+            println("Not connected.");
+            return;
+        }
+        Order order;
+        try { // Order validates symbol / quantity / price and generates the unique id
+            order = new Order(buyerId, symbol.toUpperCase(), quantity, limitPrice, OrderSide.BUY);
+        } catch (IllegalArgumentException e) {
+            println("Invalid order: " + e.getMessage());
+            return;
+        }
+
+        // register BEFORE sending, so a very fast reply always finds the order
+        synchronized (lock) {
+            openOrders.put(order.getId(), new OpenOrder(order.getId(), order.getStockSymbol(),
+                    order.getQuantity(), order.getPrice(), Status.PENDING));
+        }
+        boolean queued = enqueue(MessageType.BUY_ORDER, String.join(";", order.getId(), buyerId,
+                order.getStockSymbol(), String.valueOf(order.getQuantity()), String.valueOf(order.getPrice())));
+        if (!queued) {
+            synchronized (lock) { openOrders.remove(order.getId()); }
+            println("Could not send order (connection closed).");
+        }
+    }
+
+    public void cancel(String orderId) {
+        OpenOrder o;
+        synchronized (lock) { o = openOrders.get(orderId); }
+        if (o == null) {
+            println("No open order with id " + orderId);
+            return;
+        }
+        // The server (MatchingEngine is synchronized) decides who wins a cancel-vs-fill race;
+        // we only change local state when the server's answer arrives.
+        enqueue(MessageType.CANCEL_ORDER, String.join(";", buyerId, o.symbol(), orderId));
+    }
+
+    public void modify(String orderId, double newPrice, int newQuantity) {
+        if (!Double.isFinite(newPrice) || newPrice <= 0 || newQuantity <= 0) {
+            println("Price and quantity must be positive.");
+            return;
+        }
+        OpenOrder o;
+        synchronized (lock) { o = openOrders.get(orderId); }
+        if (o == null) {
+            println("No open order with id " + orderId);
+            return;
+        }
+        enqueue(MessageType.MODIFY_ORDER, String.join(";", buyerId, o.symbol(), orderId,
+                String.valueOf(newPrice), String.valueOf(newQuantity)));
+    }
+
+    public void requestCompanies() {
+        enqueue(MessageType.LIST_COMPANIES, buyerId);
+    }
+
+    // ------------------------------------------------------------ consistent snapshots
+
+    public void printPortfolio() {
+        Map<String, Integer> holdings;
+        Map<String, Double> prices;
+        double spent;
+        synchronized (lock) { // copy under the lock, print outside of it
+            holdings = new TreeMap<>(portfolio);
+            prices = new HashMap<>(lastPrices);
+            spent = totalSpent;
+        }
+        StringBuilder sb = new StringBuilder("--- Portfolio of " + buyerId + " ---\n");
+        if (holdings.isEmpty()) sb.append("(empty)\n");
+        holdings.forEach((s, q) -> {
+            Double p = prices.get(s);
+            sb.append(s).append(" : ").append(q);
+            if (p != null) sb.append(String.format("  (market %.2f)", p));
+            sb.append('\n');
+        });
+        sb.append(String.format("Total spent: %.2f", spent));
+        println(sb.toString());
+    }
+
+    public void printOpenOrders() {
+        List<OpenOrder> snapshot;
+        Map<String, Double> prices;
+        synchronized (lock) {
+            snapshot = new ArrayList<>(openOrders.values());
+            prices = new HashMap<>(lastPrices);
+        }
+        StringBuilder sb = new StringBuilder("--- Open BUY orders ---\n");
+        if (snapshot.isEmpty()) sb.append("(none)");
+        for (OpenOrder o : snapshot) {
+            Double p = prices.get(o.symbol());
+            sb.append(String.format("%s  %s x%d limit %.2f [%s]%s%n", o.id(), o.symbol(), o.quantity(),
+                    o.price(), o.status(), p == null ? "" : String.format("  (market %.2f)", p)));
+        }
+        println(sb.toString().stripTrailing());
+    }
+
+    // ------------------------------------------------------------ server messages (reader thread)
+
+    private void readLoop() {
+        try {
+            while (running) {
+                Object obj = in.readObject();
+                if (obj instanceof Message m) handle(m);
+            }
+        } catch (IOException e) {
+            if (running) println("[!] Connection lost: " + e.getMessage());
+        } catch (ClassNotFoundException e) {
+            println("[!] Unknown message: " + e.getMessage());
+        } finally {
+            running = false;
+        }
+    }
+
+    private void handle(Message m) {
+        String payload = m.getPayload() == null ? "" : m.getPayload();
+        String[] p = payload.split(";");
+        String event; // text to print, built while holding the lock, printed after releasing it
+
+        try {
+            switch (m.getType()) {
+                // COMPANY_LIST: symbol;name;price;qty|symbol;name;price;qty|...
+                case COMPANY_LIST -> {
+                    StringBuilder sb = new StringBuilder("--- Companies ---");
+                    synchronized (lock) {
+                        for (String row : payload.split("\\|")) {
+                            if (row.isBlank()) continue;
+                            String[] c = row.split(";");
+                            lastPrices.put(c[0], Double.parseDouble(c[2]));
+                            sb.append(String.format("%n%s (%s)  price %s  shares available %s", c[0], c[1], c[2], c[3]));
+                        }
+                    }
+                    event = sb.toString();
+                }
+                // ORDER_ACCEPTED: orderId;symbol;qty;price
+                case ORDER_ACCEPTED -> {
+                    synchronized (lock) { // only if still present: it may already have been filled
+                        openOrders.computeIfPresent(p[0], (id, o) ->
+                                new OpenOrder(o.id(), o.symbol(), o.quantity(), o.price(), Status.OPEN));
+                    }
+                    event = "[OK] Order " + p[0] + " accepted (" + p[1] + " x" + p[2] + " @ " + p[3] + ")";
+                }
+                // TRADE_EXECUTED: orderId;symbol;qty;price;tradeId
+                case TRADE_EXECUTED -> {
+                    String symbol = p[1];
+                    int qty = Integer.parseInt(p[2]);
+                    double price = Double.parseDouble(p[3]);
+                    boolean applied;
+                    synchronized (lock) {
+                        applied = appliedTrades.add(p[4]);   // idempotent: duplicates are ignored
+                        if (applied) {
+                            openOrders.remove(p[0]);          // filled completely
+                            portfolio.merge(symbol, qty, Integer::sum);
+                            totalSpent += qty * price;
+                        }
+                    }
+                    event = applied
+                            ? String.format("[TRADE %s] Bought %d %s @ %.2f (order %s)", p[4], qty, symbol, price, p[0])
+                            : null;
+                }
+                // ORDER_MODIFIED: orderId;symbol;newPrice;newQty
+                case ORDER_MODIFIED -> {
+                    synchronized (lock) { // never resurrect an order that was already filled/cancelled
+                        openOrders.computeIfPresent(p[0], (id, o) -> new OpenOrder(id, o.symbol(),
+                                Integer.parseInt(p[3]), Double.parseDouble(p[2]), Status.OPEN));
+                    }
+                    event = "[OK] Order " + p[0] + " modified";
+                }
+                // ORDER_CANCELLED: orderId
+                case ORDER_CANCELLED -> {
+                    synchronized (lock) { openOrders.remove(p[0]); }
+                    event = "[OK] Order " + p[0] + " cancelled";
+                }
+                // PRICE_UPDATE: symbol;newPrice
+                case PRICE_UPDATE -> {
+                    synchronized (lock) { lastPrices.put(p[0], Double.parseDouble(p[1])); }
+                    event = "[PRICE] " + p[0] + " -> " + p[1];
+                }
+                // ERROR: orderId;message  (orderId is the first field when the error concerns an order)
+                case ERROR -> {
+                    synchronized (lock) {
+                        OpenOrder o = openOrders.get(p[0]);
+                        if (o != null && o.status() == Status.PENDING) {
+                            openOrders.remove(p[0]);          // the new order was rejected
+                        }                                      // errors on OPEN orders (failed modify/cancel) keep it
+                    }
+                    event = "[ERROR] " + payload;
+                }
+                default -> event = "[INFO] " + m.getType() + " " + payload;
+            }
+        } catch (RuntimeException e) {
+            event = "[!] Malformed " + m.getType() + " message: " + payload;
+        }
+        if (event != null) println(event);
+    }
+
+    // ------------------------------------------------------------ console
+
+    /** One println call per event, so lines from different threads never interleave. */
+    private static void println(String s) {
+        System.out.println(s);
+    }
+
+    public void runConsole() {
+        println("Commands:\n"
+                + "  companies\n"
+                + "  buy <symbol> <qty> <maxPrice>\n"
+                + "  modify <orderId> <newPrice> <newQty>\n"
+                + "  cancel <orderId>\n"
+                + "  orders | portfolio | quit");
+        try (Scanner sc = new Scanner(System.in)) {
+            while (running && sc.hasNextLine()) {
+                String[] t = sc.nextLine().trim().split("\\s+");
+                if (t[0].isEmpty()) continue;
+                try {
+                    switch (t[0].toLowerCase()) {
+                        case "companies" -> requestCompanies();
+                        case "buy" -> buy(t[1], Integer.parseInt(t[2]), Double.parseDouble(t[3]));
+                        case "modify" -> modify(t[1], Double.parseDouble(t[2]), Integer.parseInt(t[3]));
+                        case "cancel" -> cancel(t[1]);
+                        case "orders" -> printOpenOrders();
+                        case "portfolio" -> printPortfolio();
+                        case "quit", "exit" -> { return; }
+                        default -> println("Unknown command.");
+                    }
+                } catch (ArrayIndexOutOfBoundsException | NumberFormatException e) {
+                    println("Bad arguments. Example: buy ABC 10 25.5");
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ shutdown
+
+    @Override
+    public void close() {
+        if (!closed.compareAndSet(false, true)) return; // idempotent, safe from any thread
+        if (running) {
+            enqueue(MessageType.DISCONNECT, buyerId);
+            running = false; // writer drains the queue (incl. DISCONNECT) and then exits
+        }
+        try {
+            if (writerThread != null) writerThread.join(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        try {
+            if (socket != null) socket.close(); // unblocks the reader thread
+        } catch (IOException ignored) { }
+    }
+
+    // ------------------------------------------------------------ entry point
+
+    public static void main(String[] args) {
+        String id = args.length > 0 ? args[0] : "buyer-" + (System.currentTimeMillis() % 1000);
+        String host = args.length > 1 ? args[1] : "localhost";
+        int port = args.length > 2 ? Integer.parseInt(args[2]) : 5000;
+
+        try (BuyerClient client = new BuyerClient(id, host, port)) {
+            client.connect();
+            println("Connected as " + id);
+            client.runConsole();
+        } catch (IOException e) {
+            println("Cannot connect to " + host + ":" + port + " - " + e.getMessage());
+        }
+    }
 }
