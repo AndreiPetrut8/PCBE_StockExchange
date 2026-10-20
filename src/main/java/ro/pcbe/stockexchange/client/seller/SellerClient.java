@@ -22,17 +22,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Thread-safe seller client.
- *
- * Concurrency design
- * ------------------
- *  - 3 kinds of threads touch this object:
- *      * caller threads (console or strategy threads) call sell/cancel/modify
- *      * ONE reader thread receives server messages and updates the state
- *      * ONE writer thread writes to the socket via an outbox queue
- *  - All mutable seller state is guarded by ONE lock for atomic updates.
- */
 public class SellerClient implements AutoCloseable {
 
     private enum Status { PENDING, OPEN }
@@ -53,14 +42,12 @@ public class SellerClient implements AutoCloseable {
     private volatile boolean running;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    // ---- state guarded by 'lock' ----
     private final Object lock = new Object();
-    private final Map<String, OpenOrder> openOrders = new HashMap<>(); // orderId -> order
-    private final Map<String, Integer> portfolio = new HashMap<>();    // symbol -> shares held to sell
-    private final Map<String, Double> lastPrices = new HashMap<>();    // symbol -> last known market price
-    private final Set<String> appliedTrades = new HashSet<>();         // trade ids already counted
+    private final Map<String, OpenOrder> openOrders = new HashMap<>(); 
+    private final Map<String, Integer> portfolio = new HashMap<>();    
+    private final Map<String, Double> lastPrices = new HashMap<>();    
+    private final Set<String> appliedTrades = new HashSet<>();         
     private double totalEarned = 0;
-    // ---------------------------------
 
     public SellerClient(String sellerId, String host, int port) {
         if (sellerId == null || sellerId.isBlank()) {
