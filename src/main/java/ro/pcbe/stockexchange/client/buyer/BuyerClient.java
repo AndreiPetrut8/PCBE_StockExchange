@@ -22,34 +22,10 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Thread-safe buyer client.
- *
- * Concurrency design
- * ------------------
- *  - 3 kinds of threads touch this object:
- *      * caller threads (console, or any number of strategy threads) call buy/cancel/modify
- *      * ONE reader thread receives server messages and updates the state
- *      * ONE writer thread is the only thread that ever writes to the socket
- *  - Outgoing messages go through a BlockingQueue (producer/consumer). Callers never block on
- *    network I/O and never share the ObjectOutputStream, so messages cannot interleave.
- *  - All mutable buyer state (open orders, portfolio, prices, totals) is guarded by ONE lock,
- *    so every update is atomic: a trade changes order list, portfolio and total as a single step
- *    and a reader can never see them half-updated.
- *  - Nothing blocking (socket I/O, printing) is done while holding the lock.
- *  - Trades are applied idempotently (by trade id) and events may arrive in any order
- *    (e.g. TRADE_EXECUTED before ORDER_ACCEPTED, because a BUY can fill immediately).
- *
- * Market rules this client relies on (OrderBook / Order):
- *  - BUY triggers when companyPrice <= order price, executes at the order price,
- *    and is filled completely or not at all.
- *
- * ASSUMED (not provided yet): Message(MessageType, String), getType(), getPayload(),
- * the MessageType constants below, and ';' separated payloads.
- */
+
 public class BuyerClient implements AutoCloseable {
 
-    private enum Status { PENDING, OPEN } // PENDING = sent, not yet confirmed by the server
+    private enum Status { PENDING, OPEN }
 
     private record OpenOrder(String id, String symbol, int quantity, double price, Status status) { }
 
@@ -67,14 +43,12 @@ public class BuyerClient implements AutoCloseable {
     private volatile boolean running;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    // ---- state guarded by 'lock' ----
     private final Object lock = new Object();
-    private final Map<String, OpenOrder> openOrders = new HashMap<>(); // orderId -> order
-    private final Map<String, Integer> portfolio = new HashMap<>();    // symbol -> shares owned
-    private final Map<String, Double> lastPrices = new HashMap<>();    // symbol -> last known price
-    private final Set<String> appliedTrades = new HashSet<>();         // trade ids already counted
+    private final Map<String, OpenOrder> openOrders = new HashMap<>(); 
+    private final Map<String, Integer> portfolio = new HashMap<>();    
+    private final Map<String, Double> lastPrices = new HashMap<>();   
+    private final Set<String> appliedTrades = new HashSet<>();       
     private double totalSpent = 0;
-    // ---------------------------------
 
     public BuyerClient(String buyerId, String host, int port) {
         if (buyerId == null || buyerId.isBlank()) {
@@ -85,11 +59,9 @@ public class BuyerClient implements AutoCloseable {
         this.port = port;
     }
 
-    // ------------------------------------------------------------ connection
-
     public void connect() throws IOException {
         socket = new Socket(host, port);
-        out = new ObjectOutputStream(socket.getOutputStream()); // output first, then input
+        out = new ObjectOutputStream(socket.getOutputStream()); 
         out.flush();
         in = new ObjectInputStream(socket.getInputStream());
         running = true;
@@ -105,7 +77,6 @@ public class BuyerClient implements AutoCloseable {
         enqueue(MessageType.LIST_COMPANIES, buyerId);
     }
 
-    /** Non-blocking: hands the message to the writer thread. */
     private boolean enqueue(MessageType type, String payload) {
         if (!running) return false;
         return outbox.offer(new Message(type, payload));
@@ -116,7 +87,7 @@ public class BuyerClient implements AutoCloseable {
             while (true) {
                 Message m = outbox.poll(100, TimeUnit.MILLISECONDS);
                 if (m == null) {
-                    if (!running) break;      // nothing left to flush and we are closing
+                    if (!running) break;
                     continue;
                 }
                 out.writeObject(m);
@@ -131,22 +102,19 @@ public class BuyerClient implements AutoCloseable {
         }
     }
 
-    // ------------------------------------------------------------ requests (thread-safe)
-
     public void buy(String symbol, int quantity, double limitPrice) {
         if (!running) {
             println("Not connected.");
             return;
         }
         Order order;
-        try { // Order validates symbol / quantity / price and generates the unique id
+        try { 
             order = new Order(buyerId, symbol.toUpperCase(), quantity, limitPrice, OrderSide.BUY);
         } catch (IllegalArgumentException e) {
             println("Invalid order: " + e.getMessage());
             return;
         }
 
-        // register BEFORE sending, so a very fast reply always finds the order
         synchronized (lock) {
             openOrders.put(order.getId(), new OpenOrder(order.getId(), order.getStockSymbol(),
                     order.getQuantity(), order.getPrice(), Status.PENDING));
@@ -166,8 +134,7 @@ public class BuyerClient implements AutoCloseable {
             println("No open order with id " + orderId);
             return;
         }
-        // The server (MatchingEngine is synchronized) decides who wins a cancel-vs-fill race;
-        // we only change local state when the server's answer arrives.
+        
         enqueue(MessageType.CANCEL_ORDER, String.join(";", buyerId, o.symbol(), orderId));
     }
 
@@ -190,13 +157,11 @@ public class BuyerClient implements AutoCloseable {
         enqueue(MessageType.LIST_COMPANIES, buyerId);
     }
 
-    // ------------------------------------------------------------ consistent snapshots
-
     public void printPortfolio() {
         Map<String, Integer> holdings;
         Map<String, Double> prices;
         double spent;
-        synchronized (lock) { // copy under the lock, print outside of it
+        synchronized (lock) { 
             holdings = new TreeMap<>(portfolio);
             prices = new HashMap<>(lastPrices);
             spent = totalSpent;
@@ -230,8 +195,6 @@ public class BuyerClient implements AutoCloseable {
         println(sb.toString().stripTrailing());
     }
 
-    // ------------------------------------------------------------ server messages (reader thread)
-
     private void readLoop() {
         try {
             while (running) {
@@ -250,7 +213,7 @@ public class BuyerClient implements AutoCloseable {
     private void handle(Message m) {
         String payload = m.getPayload() == null ? "" : m.getPayload();
         String[] p = payload.split(";");
-        String event; // text to print, built while holding the lock, printed after releasing it
+        String event; 
 
         try {
             switch (m.getType()) {
@@ -269,7 +232,7 @@ public class BuyerClient implements AutoCloseable {
                 }
                 // ORDER_ACCEPTED: orderId;symbol;qty;price
                 case ORDER_ACCEPTED -> {
-                    synchronized (lock) { // only if still present: it may already have been filled
+                    synchronized (lock) {
                         openOrders.computeIfPresent(p[0], (id, o) ->
                                 new OpenOrder(o.id(), o.symbol(), o.quantity(), o.price(), Status.OPEN));
                     }
@@ -282,9 +245,9 @@ public class BuyerClient implements AutoCloseable {
                     double price = Double.parseDouble(p[3]);
                     boolean applied;
                     synchronized (lock) {
-                        applied = appliedTrades.add(p[4]);   // idempotent: duplicates are ignored
+                        applied = appliedTrades.add(p[4]); 
                         if (applied) {
-                            openOrders.remove(p[0]);          // filled completely
+                            openOrders.remove(p[0]);          
                             portfolio.merge(symbol, qty, Integer::sum);
                             totalSpent += qty * price;
                         }
@@ -295,7 +258,7 @@ public class BuyerClient implements AutoCloseable {
                 }
                 // ORDER_MODIFIED: orderId;symbol;newPrice;newQty
                 case ORDER_MODIFIED -> {
-                    synchronized (lock) { // never resurrect an order that was already filled/cancelled
+                    synchronized (lock) {
                         openOrders.computeIfPresent(p[0], (id, o) -> new OpenOrder(id, o.symbol(),
                                 Integer.parseInt(p[3]), Double.parseDouble(p[2]), Status.OPEN));
                     }
@@ -311,13 +274,13 @@ public class BuyerClient implements AutoCloseable {
                     synchronized (lock) { lastPrices.put(p[0], Double.parseDouble(p[1])); }
                     event = "[PRICE] " + p[0] + " -> " + p[1];
                 }
-                // ERROR: orderId;message  (orderId is the first field when the error concerns an order)
+                // ERROR: orderId;message
                 case ERROR -> {
                     synchronized (lock) {
                         OpenOrder o = openOrders.get(p[0]);
                         if (o != null && o.status() == Status.PENDING) {
-                            openOrders.remove(p[0]);          // the new order was rejected
-                        }                                      // errors on OPEN orders (failed modify/cancel) keep it
+                            openOrders.remove(p[0]);          
+                        }                                      
                     }
                     event = "[ERROR] " + payload;
                 }
@@ -329,9 +292,6 @@ public class BuyerClient implements AutoCloseable {
         if (event != null) println(event);
     }
 
-    // ------------------------------------------------------------ console
-
-    /** One println call per event, so lines from different threads never interleave. */
     private static void println(String s) {
         System.out.println(s);
     }
@@ -365,14 +325,12 @@ public class BuyerClient implements AutoCloseable {
         }
     }
 
-    // ------------------------------------------------------------ shutdown
-
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) return; // idempotent, safe from any thread
+        if (!closed.compareAndSet(false, true)) return; 
         if (running) {
             enqueue(MessageType.DISCONNECT, buyerId);
-            running = false; // writer drains the queue (incl. DISCONNECT) and then exits
+            running = false;
         }
         try {
             if (writerThread != null) writerThread.join(1000);
@@ -380,11 +338,10 @@ public class BuyerClient implements AutoCloseable {
             Thread.currentThread().interrupt();
         }
         try {
-            if (socket != null) socket.close(); // unblocks the reader thread
+            if (socket != null) socket.close();
         } catch (IOException ignored) { }
     }
 
-    // ------------------------------------------------------------ entry point
 
     public static void main(String[] args) {
         String id = args.length > 0 ? args[0] : "buyer-" + (System.currentTimeMillis() % 1000);
