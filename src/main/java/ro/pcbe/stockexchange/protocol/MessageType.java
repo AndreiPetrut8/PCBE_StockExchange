@@ -5,6 +5,7 @@ public enum MessageType {
     REGISTER,
     LIST_COMPANIES,
     BUY_ORDER,
+    SELL_ORDER,
     CANCEL_ORDER,
     MODIFY_ORDER,
     COMPANY_LIST,
