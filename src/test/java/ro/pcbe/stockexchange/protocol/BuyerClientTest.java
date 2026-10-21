@@ -28,16 +28,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Teste pentru BuyerClient folosind un server fals (FakeServer) care:
- *  - colectează mesajele trimise de client;
- *  - trimite către client mesajele scriptate de test.
- *
- * Starea clientului (portofoliu, ordine deschise) se verifică prin ce afișează
- * printPortfolio() / printOpenOrders(), captat din System.out.
- *
- * Cerințe: JUnit 5 + clasele Order / OrderSide din proiect (BuyerClient le folosește).
- */
 class BuyerClientTest {
 
     private static final String BUYER = "buyer1";
@@ -49,8 +39,6 @@ class BuyerClientTest {
     private PrintStream originalOut;
     private Locale originalLocale;
     private final AtomicInteger syncCounter = new AtomicInteger();
-
-    // ------------------------------------------------------------ setup / teardown
 
     @BeforeEach
     void setUp() throws Exception {
@@ -67,7 +55,6 @@ class BuyerClientTest {
         client = new BuyerClient(BUYER, "localhost", server.port());
         client.connect();
 
-        // mesajele trimise automat la connect()
         Message register = server.next();
         assertEquals(MessageType.REGISTER, register.getType());
         assertEquals(BUYER + ";BUYER", register.getPayload());
@@ -84,9 +71,6 @@ class BuyerClientTest {
         Locale.setDefault(originalLocale);
     }
 
-    // ------------------------------------------------------------ helpers
-
-    /** Așteaptă până apare text în System.out. */
     private void awaitOutput(String expected) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 3000;
         while (System.currentTimeMillis() < deadline) {
@@ -96,17 +80,12 @@ class BuyerClientTest {
         fail("Expected output not found: \"" + expected + "\"\nActual output:\n" + captured);
     }
 
-    /**
-     * Sincronizare: reader-ul procesează mesajele în ordine, deci dacă markerul a fost
-     * procesat, toate mesajele trimise înainte de el au fost procesate deja.
-     */
     private void sync() throws Exception {
         String marker = "SYNC" + syncCounter.incrementAndGet();
         server.send(MessageType.PRICE_UPDATE, marker + ";1.0");
         awaitOutput("[PRICE] " + marker + " -> 1.0");
     }
 
-    /** Rulează o acțiune și returnează doar ce a fost afișat de ea. */
     private String printed(Runnable action) {
         int before = captured.size();
         action.run();
@@ -121,7 +100,6 @@ class BuyerClientTest {
         return printed(client::printPortfolio);
     }
 
-    /** Trimite un BUY prin client și returnează id-ul ordinului generat. */
     private String placeBuy(String symbol, int qty, double price) throws Exception {
         client.buy(symbol, qty, price);
         Message m = server.next();
@@ -134,7 +112,6 @@ class BuyerClientTest {
         awaitOutput("[OK] Order " + id + " accepted");
     }
 
-    // ------------------------------------------------------------ constructor
 
     @Test
     void blankBuyerIdIsRejected() {
@@ -149,11 +126,9 @@ class BuyerClientTest {
         assertTrue(out.contains("Not connected."));
     }
 
-    // ------------------------------------------------------------ requests -> server
-
     @Test
     void buySendsWellFormedBuyOrder() throws Exception {
-        client.buy("abc", 10, 25.5); // simbolul trebuie normalizat la majuscule
+        client.buy("abc", 10, 25.5);
         Message m = server.next();
 
         assertEquals(MessageType.BUY_ORDER, m.getType());
@@ -231,7 +206,6 @@ class BuyerClientTest {
         assertTrue(out.contains("No open order with id nope"), out);
     }
 
-    // ------------------------------------------------------------ server -> client
 
     @Test
     void companyListIsPrintedAndPricesRemembered() throws Exception {
@@ -292,7 +266,6 @@ class BuyerClientTest {
 
     @Test
     void tradeBeforeAcceptDoesNotResurrectOrder() throws Exception {
-        // un BUY care se execută imediat: TRADE_EXECUTED sosește înaintea lui ORDER_ACCEPTED
         String id = placeBuy("ABC", 10, 25.5);
         server.send(MessageType.TRADE_EXECUTED, id + ";ABC;10;25.5;T1");
         server.send(MessageType.ORDER_ACCEPTED, id + ";ABC;10;25.5");
@@ -382,8 +355,6 @@ class BuyerClientTest {
         awaitOutput("[INFO] BUY_ORDER x");
     }
 
-    // ------------------------------------------------------------ concurrency
-
     @Test
     void concurrentBuysAreAllDeliveredIntact() throws Exception {
         final int n = 100;
@@ -424,8 +395,6 @@ class BuyerClientTest {
         assertTrue(portfolio.contains("Total spent: 400.00"), portfolio);
     }
 
-    // ------------------------------------------------------------ shutdown
-
     @Test
     void closeSendsDisconnectAndIsIdempotent() throws Exception {
         client.close();
@@ -439,15 +408,12 @@ class BuyerClientTest {
         assertTrue(out.contains("Not connected."));
     }
 
-    // ------------------------------------------------------------ utils
-
     private static int count(String text, String part) {
         int c = 0, i = 0;
         while ((i = text.indexOf(part, i)) >= 0) { c++; i += part.length(); }
         return c;
     }
 
-    /** Server minimal: acceptă o conexiune, memorează mesajele primite, trimite ce îi ceri. */
     private static class FakeServer implements AutoCloseable {
         private final ServerSocket serverSocket;
         private final BlockingQueue<Message> received = new LinkedBlockingQueue<>();
@@ -456,7 +422,7 @@ class BuyerClientTest {
         private ObjectOutputStream out;
 
         FakeServer() throws IOException {
-            serverSocket = new ServerSocket(0); // port liber ales de OS
+            serverSocket = new ServerSocket(0); 
         }
 
         int port() { return serverSocket.getLocalPort(); }
@@ -465,7 +431,7 @@ class BuyerClientTest {
             Thread t = new Thread(() -> {
                 try {
                     socket = serverSocket.accept();
-                    out = new ObjectOutputStream(socket.getOutputStream()); // output first, then input
+                    out = new ObjectOutputStream(socket.getOutputStream()); 
                     out.flush();
                     ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
                     ready.countDown();
