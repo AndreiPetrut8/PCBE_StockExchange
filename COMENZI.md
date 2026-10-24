@@ -26,6 +26,7 @@ portfolio
 quit
 ```
 
+
 | Comanda | Ce face |
 |---|---|
 | `companies` | companiile, pretul si actiunile disponibile |
