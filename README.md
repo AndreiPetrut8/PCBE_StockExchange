@@ -56,3 +56,12 @@ Este necesar JDK 17 sau mai nou si Maven:
 ```bash
 mvn test
 ```
+
+## Rulare
+
+```bash
+mvn -q compile
+java -cp target/classes ro.pcbe.stockexchange.Main
+java -cp target/classes ro.pcbe.stockexchange.client.buyer.BuyerClient ana
+java -cp target/classes ro.pcbe.stockexchange.client.seller.SellerClient dan
+```
