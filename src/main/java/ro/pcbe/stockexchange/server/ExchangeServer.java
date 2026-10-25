@@ -76,7 +76,12 @@ public class ExchangeServer {
     }
 
     boolean register(String clientId, ClientHandler handler) {
-        return clients.putIfAbsent(clientId, handler) == null;
+        // Error 2: The separate check and put can both succeed for concurrent registrations.
+        if (clients.containsKey(clientId)) {
+            return false;
+        }
+        clients.put(clientId, handler);
+        return true;
     }
 
     void unregister(String clientId, ClientHandler handler) {
@@ -97,9 +102,13 @@ public class ExchangeServer {
         List<Notice> notices = new ArrayList<>();
         String accepted = String.join(";", order.getId(), order.getStockSymbol(),
                 String.valueOf(order.getQuantity()), String.valueOf(order.getPrice()));
+        List<Trade> trades;
         synchronized (engine) {
-            List<Trade> trades = engine.submitOrder(order);
-            openOrders.put(order.getId(), order);
+            trades = engine.submitOrder(order);
+        }
+        // Error 1: This unsynchronized HashMap write races with collectFills() iteration.
+        openOrders.put(order.getId(), order);
+        synchronized (engine) {
             notices.add(new Notice(order.getClientId(), new Message(MessageType.ORDER_ACCEPTED, accepted)));
             collectFills(trades, notices);
         }
